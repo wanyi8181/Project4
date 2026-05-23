@@ -1,0 +1,259 @@
+from ultralytics import YOLO
+import torch
+import torch.nn as nn
+import cv2
+import os
+import numpy as np
+from pathlib import Path
+from typing import List, Tuple, Optional
+
+
+class SASP(nn.Module):
+    """
+    SASP (Self-Adaptive Softmax Perturbation) 置信度增强模块
+    
+    改进点：
+    1. 可学习温度参数控制分布锐度
+    2. 保留原始置信度尺度，避免全局归一化导致的相对性失真
+    3. 添加eps防止数值不稳定
+    """
+    def __init__(self, alpha_init: float = 0.8, temp_init: float = 1.0):
+        super().__init__()
+        self.alpha = nn.Parameter(torch.tensor(alpha_init))
+        self.temp = nn.Parameter(torch.tensor(temp_init))
+        self.eps = 1e-6
+        
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # 温度缩放 + 幂变换，保持个体增强的独立性
+        x = x.clamp(min=self.eps)  # 防止负值和零
+        x_scaled = (x / self.temp) ** self.alpha
+        # 使用sigmoid映射回[0,1]区间，避免全局归一化
+        return torch.sigmoid(x_scaled - 0.5)  # 中心点在0.5附近
+
+
+class SASPDetector:
+    """
+    封装检测器，支持模型热加载、批量处理和自适应阈值
+    """
+    def __init__(self, model_path: str = "yolov8n.pt", device: str = "auto"):
+        self.device = self._get_device(device)
+        self.model = YOLO(model_path)
+        self.model.to(self.device)
+        self.sasp = SASP().to(self.device)
+        self.class_names = self.model.names
+        
+        # 自适应阈值参数（可根据数据集统计调整）
+        self.base_conf = 0.25
+        self.sasp_conf = 0.1   # SASP前置低阈值，捕获更多候选框
+        self.min_conf = 0.15   # 后置最低保留阈值
+        
+    def _get_device(self, device: str) -> str:
+        if device == "auto":
+            return "cuda" if torch.cuda.is_available() else "cpu"
+        return device
+    
+    def calibrate_sasp(self, val_images: List[str], epochs: int = 10):
+        """
+        在验证集上校准SASP参数，使增强后的置信度分布更贴合真实精度
+        
+        Args:
+            val_images: 验证图片路径列表（需包含标注或人工筛选的正样本）
+            epochs: 优化轮数
+        """
+        print(f"🔧 开始校准SASP参数（设备: {self.device}）...")
+        optimizer = torch.optim.Adam(self.sasp.parameters(), lr=0.01)
+        
+        for epoch in range(epochs):
+            total_loss = 0.0
+            for img_path in val_images:
+                results = self.model(img_path, conf=self.sasp_conf, verbose=False)
+                boxes = results[0].boxes
+                if len(boxes) == 0:
+                    continue
+                    
+                confs = boxes.conf.to(self.device)
+                enhanced = self.sasp(confs.unsqueeze(1)).squeeze()
+                
+                # 损失：希望高原始置信度 -> 更高增强值，低原始置信度 -> 更低增强值
+                # 使用排序一致性损失（Spearman近似）
+                target = torch.sigmoid((confs - confs.mean()) / (confs.std() + 1e-6))
+                loss = nn.functional.mse_loss(enhanced, target)
+                
+                optimizer.zero_grad()
+                loss.backward()
+                optimizer.step()
+                total_loss += loss.item()
+                
+            print(f"  Epoch {epoch+1}/{epochs}, Loss: {total_loss/len(val_images):.4f}")
+        
+        print(f"✅ 校准完成！Alpha: {self.sasp.alpha.item():.3f}, Temp: {self.sasp.temp.item():.3f}")
+    
+    def detect_single(self, img_path: str, save_dir: str = "results") -> Tuple[np.ndarray, np.ndarray, dict]:
+        """
+        单图检测，返回对比结果和统计信息
+        
+        Returns:
+            img_original: 原版YOLO绘制结果
+            img_sasp: SASP增强版绘制结果  
+            stats: 包含检测数量、平均置信度等统计信息
+        """
+        if not os.path.exists(img_path):
+            raise FileNotFoundError(f"❌ 文件不存在: {img_path}")
+            
+        Path(save_dir).mkdir(exist_ok=True)
+        img_name = Path(img_path).stem
+        
+        # 1. 原版YOLO检测
+        res_original = self.model(img_path, conf=self.base_conf, verbose=False)
+        img_original = res_original[0].plot()
+        orig_stats = self._extract_stats(res_original[0].boxes)
+        
+        # 2. SASP增强检测
+        res_raw = self.model(img_path, conf=self.sasp_conf, verbose=False)
+        boxes = res_raw[0].boxes
+        img_sasp = cv2.imread(img_path)
+        img_sasp = cv2.cvtColor(img_sasp, cv2.COLOR_BGR2RGB)
+        
+        sasp_stats = {"count": 0, "mean_conf": 0.0, "boxes": []}
+        
+        if len(boxes) > 0:
+            with torch.no_grad():
+                confs = boxes.conf.to(self.device)
+                enhanced_confs = self.sasp(confs.unsqueeze(1)).squeeze(1)
+            
+            # 自适应后置过滤：使用动态阈值（均值+标准差）
+            mean_conf = enhanced_confs.mean().item()
+            std_conf = enhanced_confs.std().item()
+            adaptive_threshold = max(self.min_conf, mean_conf - 0.5 * std_conf)
+            
+            keep_mask = enhanced_confs > adaptive_threshold
+            filtered_boxes = boxes[keep_mask]
+            filtered_confs = enhanced_confs[keep_mask]
+            
+            # 按置信度排序绘制（高置信度在上层）
+            sorted_indices = torch.argsort(filtered_confs, descending=True)
+            
+            for idx in sorted_indices:
+                box = filtered_boxes[idx]
+                conf = filtered_confs[idx].item()
+                x1, y1, x2, y2 = map(int, box.xyxy[0].cpu().numpy())
+                cls_id = int(box.cls[0])
+                cls_name = self.class_names[cls_id]
+                
+                # 根据置信度动态调整颜色（高置信度更绿，低置信度偏黄）
+                color = self._conf_to_color(conf)
+                
+                cv2.rectangle(img_sasp, (x1, y1), (x2, y2), color, 2)
+                label = f"{cls_name}: {conf:.3f}"
+                (tw, th), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.6, 2)
+                cv2.rectangle(img_sasp, (x1, y1-th-10), (x1+tw, y1), color, -1)
+                cv2.putText(img_sasp, label, (x1, y1-5),
+                           cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 0), 2)
+                
+                sasp_stats["boxes"].append({
+                    "class": cls_name, "conf": conf,
+                    "bbox": [x1, y1, x2, y2]
+                })
+            
+            sasp_stats["count"] = len(filtered_boxes)
+            sasp_stats["mean_conf"] = filtered_confs.mean().item() if len(filtered_confs) > 0 else 0.0
+            
+        # 保存结果
+        orig_path = os.path.join(save_dir, f"{img_name}_original.jpg")
+        sasp_path = os.path.join(save_dir, f"{img_name}_sasp.jpg")
+        cv2.imwrite(orig_path, cv2.cvtColor(img_original, cv2.COLOR_RGB2BGR))
+        cv2.imwrite(sasp_path, cv2.cvtColor(img_sasp, cv2.COLOR_RGB2BGR))
+        
+        stats = {
+            "original": orig_stats,
+            "sasp": sasp_stats,
+            "threshold_used": adaptive_threshold if len(boxes) > 0 else self.base_conf
+        }
+        
+        return img_original, img_sasp, stats
+    
+    def _extract_stats(self, boxes) -> dict:
+        if len(boxes) == 0:
+            return {"count": 0, "mean_conf": 0.0}
+        return {
+            "count": len(boxes),
+            "mean_conf": boxes.conf.mean().item()
+        }
+    
+    def _conf_to_color(self, conf: float) -> Tuple[int, int, int]:
+        """置信度映射到BGR颜色"""
+        if conf > 0.8:
+            return (0, 255, 0)      # 绿
+        elif conf > 0.5:
+            return (0, 255, 255)    # 黄
+        else:
+            return (0, 165, 255)    # 橙
+    
+    def batch_detect(self, img_dir: str, save_dir: str = "results") -> List[dict]:
+        """批量检测目录下所有图片"""
+        img_paths = list(Path(img_dir).glob("*.jpg")) + \
+                   list(Path(img_dir).glob("*.png")) + \
+                   list(Path(img_dir).glob("*.jpeg"))
+        
+        all_stats = []
+        for img_path in img_paths:
+            print(f"🔍 处理: {img_path.name}")
+            _, _, stats = self.detect_single(str(img_path), save_dir)
+            all_stats.append(stats)
+        
+        return all_stats
+
+
+def interactive_mode():
+    """交互式检测模式"""
+    print("🚀 初始化SASP检测器...")
+    detector = SASPDetector("yolov8n.pt")
+    print("✅ 模型加载成功！")
+    
+    while True:
+        print("\n" + "="*50)
+        print("请输入图片路径（直接拖入或输入路径，输入 q 退出）：")
+        user_input = input(">>> ").strip().strip('"').strip("'")
+        
+        if user_input.lower() in ('q', 'quit', 'exit'):
+            print("👋 再见！")
+            break
+            
+        if not user_input:
+            continue
+            
+        try:
+            orig_img, sasp_img, stats = detector.detect_single(user_input)
+            
+            print(f"\n📊 检测结果对比:")
+            print(f"  原版YOLO: 检测到 {stats['original']['count']} 个目标, "
+                  f"平均置信度: {stats['original']['mean_conf']:.3f}")
+            print(f"  SASP增强: 检测到 {stats['sasp']['count']} 个目标, "
+                  f"平均置信度: {stats['sasp']['mean_conf']:.3f}, "
+                  f"自适应阈值: {stats['threshold_used']:.3f}")
+            
+            # 创建对比图
+            h, w = orig_img.shape[:2]
+            combined = np.zeros((h, w*2, 3), dtype=np.uint8)
+            combined[:, :w] = orig_img
+            combined[:, w:] = sasp_img
+            
+            # 添加标题
+            cv2.putText(combined, "Original YOLO", (10, 30),
+                       cv2.FONT_HERSHEY_SIMPLEX, 1, (255, 255, 255), 2)
+            cv2.putText(combined, "SASP Enhanced", (w+10, 30),
+                       cv2.FONT_HERSHEY_SIMPLEX, 1, (255, 255, 255), 2)
+            
+            cv2.imshow("SASP Detection Comparison", cv2.cvtColor(combined, cv2.COLOR_RGB2BGR))
+            key = cv2.waitKey(0)
+            cv2.destroyAllWindows()
+            
+            if key == 27:  # ESC退出
+                break
+                
+        except Exception as e:
+            print(f"❌ 错误: {e}")
+
+
+if __name__ == "__main__":
+    interactive_mode()
