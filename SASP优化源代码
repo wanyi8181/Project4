@@ -1,0 +1,80 @@
+from ultralytics import YOLO
+import torch
+import torch.nn as nn
+import cv2
+import os
+
+
+# SASP 置信度增强公式（优化版，α=0.8）
+class SASP(nn.Module):
+    def __init__(self, alpha_init=0.8):
+        super().__init__()
+        self.alpha = nn.Parameter(torch.tensor(alpha_init))
+
+    def forward(self, x):
+        x2 = (x ** 2) + 1
+        p = x2 ** self.alpha
+        return p / p.sum(dim=-1, keepdim=True)
+
+
+sasp = SASP()
+
+
+def sasp_detect():
+    print("\n请输入图片路径（可直接拖入图片）：")
+    img_path = input("路径: ").strip().strip('"')
+
+    if not os.path.exists(img_path):
+        print("❌ 文件不存在！")
+        return
+
+    print(f"🔍 正在检测: {img_path}")
+
+    # 1. 原版YOLO检测（标准置信度过滤）
+    res_original = model(img_path, conf=0.25, verbose=False)
+    img_original = res_original[0].plot()
+
+    # 2. SASP增强版检测（优化版）
+    # 前置噪声控制：初始阈值设为0.1，减少低置信度噪声
+    res_raw = model(img_path, conf=0.1, verbose=False)
+    boxes = res_raw[0].boxes
+    img_sasp = cv2.imread(img_path)
+
+    if len(boxes) > 0:
+        # 应用SASP重新计算置信度
+        new_confs = sasp(boxes.conf.unsqueeze(1)).squeeze(1)
+
+        # 严格后置过滤：仅保留置信度>0.25的框
+        keep_mask = new_confs > 0.25
+        filtered_boxes = boxes[keep_mask]
+        filtered_confs = new_confs[keep_mask]
+
+        # 绘制有效框
+        for i, box in enumerate(filtered_boxes):
+            x1, y1, x2, y2 = map(int, box.xyxy[0])
+            cls = res_raw[0].names[int(box.cls)]
+            conf = float(filtered_confs[i])
+
+            cv2.rectangle(img_sasp, (x1, y1), (x2, y2), (0, 255, 0), 2)
+            cv2.putText(img_sasp, f"{cls}: {conf:.2f}", (x1, y1 - 10),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 2)
+
+    # 保存并显示对比结果
+    cv2.imwrite("原版YOLO检测结果.jpg", img_original)
+    cv2.imwrite("SASP增强版检测结果.jpg", img_sasp)
+
+    print("\n✅ 检测完成！")
+    print("📸 原版YOLO结果已保存为：原版YOLO检测结果.jpg")
+    print("✨ SASP增强版结果已保存为：SASP增强版检测结果.jpg")
+
+    cv2.imshow("原版YOLO检测结果", img_original)
+    cv2.imshow("SASP增强版检测结果", img_sasp)
+    cv2.waitKey(0)
+    cv2.destroyAllWindows()
+
+
+if __name__ == "__main__":
+    print("🚀 加载YOLOv8模型...")
+    model = YOLO("yolov8n.pt")
+    print("✅ 模型加载成功！")
+    sasp_detect()
